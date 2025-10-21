@@ -1,0 +1,1 @@
+bestes Modell ist /home/lukas-zeh/Documents/GNN_CableSimulation/MLP/models/2D_mlp_model_20k.pth

@@ -1,0 +1,37 @@
+<mujoco model="cable">
+    <default>
+        <geom solimp="0.8 0.95 0.001 0.5 2" solref="0.02 1" condim="6" friction="0.5"/>
+        <joint damping="1" armature="0.1"/>
+    </default>
+
+    <worldbody>
+      <body>
+        <geom type="box" size=".01 .01 .01" pos=".3 0 .005" condim="6" />
+        <!-- <geom type="box" size=".01 .01 .01" pos=".3 0 .01" condim="6" /> -->
+        <joint type="slide" name="pos_x" axis="1 0 0"/>
+        <joint type="slide" name="pos_z" axis="0 -1 0"/>
+        <joint type="slide" name="pos_y" axis="0 0 1"/>
+
+        <body name="CB0" pos=".3 0 0.005" euler="0 0 0">
+          <composite type="cable" curve="s" count="50 1 1" size="0.5" offset="0 0 0" initial="none">
+            <plugin plugin="mujoco.elasticity.cable">
+               <!--Units are in Pa (SI)-->
+              <config key="twist" value="1e7"/>   # 1e7 Pa
+              <config key="bend" value="4e6"/>    #  4e6 Pa
+              <config key="vmax" value="0.05"/>   # 0.05 m/s
+            </plugin>
+            <joint kind="main" damping=".015"/>
+            <!-- <joint type="free" /> -->
+            <geom type="capsule" size=".005" rgba=".8 .2 .1 1" condim="1"/>
+          </composite>
+        </body>
+      </body>,
+
+    </worldbody>
+   <actuator>
+        <position group="1" name="pos_x" joint="pos_x" kp="5"/>
+        <position group="1" name="pos_y" joint="pos_y" kp="5"/>
+        <position group="1" name="pos_z" joint="pos_z" kp="5"/>
+    </actuator>
+
+</mujoco>
