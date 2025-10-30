@@ -433,7 +433,7 @@ controller = InverseKinematicsController(
     dt=0.002,
     max_angvel=0.3
 )
-x_current, cable_pos_current = get_state_from_mujoco(model, data, dataset, device)
+x_current, cable_pos_current, cable_pos_current_3d = get_state_from_mujoco(model, data, dataset, device)
 #random_idx = random.randint(0, len(dataset) - 1)
 random_idx = np.random.choice([1940])
 inputs_dumm, p_target = dataset[random_idx]
