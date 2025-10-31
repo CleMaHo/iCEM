@@ -37,26 +37,29 @@ nn_model.eval()
 
 
 # Parameters
-NUM_SAMPLES = 50
-horizon = 20
+NUM_SAMPLES = 100
+horizon = 30
 NUM_ELITES = 10
 elites_frac = 0.3
 colored_beta = 1.0
-icem_optimizations = 5
+icem_optimizations = 4
 reduction_factor = 1.25
 momentum =0.1
+STD_DEV = torch.tensor([0.4, 0.2, 0.02, 0.5], device=device)
+
 
 dt = 0.2
 control_dim = 4
 
 # Define standard deviation for each control dimension
-STD_DEV = torch.tensor([0.2, 0.2, 0.2, 0.5], device=device)
+# STD_DEV = torch.tensor([0.2, 0.2, 0.2, 0.5], device=device)
 Q = torch.eye(18, device=device) * 300
 S = torch.eye(control_dim, device=device) * 10  # Example value, can be adjusted
 R = torch.eye(4, device=device) * 100 # 0.01
 
-NUM_TRIALS = 2  # Number of trials
-MAX_ITERATIONS = 5  # corresponds to approx. 30 seconds (with dt ~ 0.02)
+NUM_TRIALS = 10  # Number of trials
+MAX_ITERATIONS = 200
+# corresponds to approx. 30 seconds (with dt ~ 0.02)
 print('Everything loaded successfully.')
 
 #############################################################
@@ -117,99 +120,89 @@ def get_state_from_mujoco(model, data, dataset, device, prev_cable_pos=None):
 
     # Create overall state
     state = torch.cat((current_robot_state, current_dlo_state), dim=0)
-    return state, cable_pos, cable_pos_3d
+    return state, cable_pos
 
 
-def forward_model_batch(x0, u_seq, model, dataset, dt=0.2, device=device):
+def forward_model_batch(x_batch, u_batch, model, pred_mocap_ids, data, dt=0.02):
     """
-    Propagate a batch of states through a full control horizon.
-    
+    Batch version of the forward_model function.
+    Processes a batch of states and control inputs simultaneously.
     Args:
-        x0: Tensor of shape (num_samples, state_dim), initial states
-        u_seq: Tensor of shape (num_samples, horizon, control_dim), control sequences
-        nn_model: trained neural network model
-        dataset: dataset object containing normalization stats
-        dt: simulation timestep
-        device: torch device
-    
+        x_batch: Tensor of shape (batch_size, state_dim)
+        u_batch: Tensor of shape (batch_size, control_dim)
     Returns:
-        x_traj: Tensor of shape (num_samples, horizon+1, state_dim)
-                containing the state trajectory for each sample
+        x_next_batch: Tensor of shape (batch_size, state_dim)
     """
-    num_samples, horizon, control_dim = u_seq.shape
-    state_dim = x0.shape[1]
+    # 1. Extract states for the entire batch
+    batch_size = x_batch.shape[0]
 
-    # Initialize trajectory tensor
-    x_traj = torch.zeros(num_samples, horizon+1, state_dim, device=device)
-    x_traj[:, 0, :] = x0
+    # Extract robot states
+    ee_pos = x_batch[:, 0:4]          # (batch_size, 4)
+    ee_vel = x_batch[:, 4:8]          # (batch_size, 4)
 
-    x_current = x0
+    # Extract cable states
+    feature_pos = x_batch[:, 8:26].view(batch_size, 9, 2)   # (batch_size, 9, 2)
+    feature_vel = x_batch[:, 26:44].view(batch_size, 9, 2)  # (batch_size, 9, 2)
 
-    for t in range(horizon):
-        u_current = u_seq[:, t, :]  # (num_samples, control_dim)
-        
-        # --- One-step forward ---
-        batch_size = x_current.shape[0]
+    # 2. Compute new robot states for the whole batch
+    ee_vel_new = ee_vel + u_batch  # (batch_size, 4)
+    v_max = 0.2
+    ee_vel_new = torch.clamp(ee_vel_new, -v_max, v_max)
+    ee_pos_new = ee_pos + ee_vel_new * dt  # (batch_size, 4)
 
-        ee_pos = x_current[:, 0:4]
-        ee_vel = x_current[:, 4:8]
-        feature_pos = x_current[:, 8:26].view(batch_size, 9, 2)
-        feature_vel = x_current[:, 26:44].view(batch_size, 9, 2)
+    # 3. Normalization for the entire batch
+    eps = 1e-9
+    l2_norm_cable_pos = torch.norm(feature_pos, p=2, dim=2, keepdim=True)  # (batch_size, 9, 1)
 
-        # Update robot states
-        ee_vel_new = torch.clamp(ee_vel + u_current, -0.2, 0.2)
-        ee_pos_new = ee_pos + ee_vel_new * dt
+    # Normalize robot states
+    ee_pos_normalized = (ee_pos_new - dataset.EE_pos_mean.to(device)) / (dataset.EE_pos_std.to(device) + eps)
+    ee_vel_normalized = (ee_vel_new - dataset.EE_vel_mean.to(device)) / (dataset.EE_vel_std.to(device) + eps)
 
-        # Normalize states
-        eps = 1e-9
-        ee_pos_norm = (ee_pos_new - dataset.EE_pos_mean.to(device)) / (dataset.EE_pos_std.to(device) + eps)
-        ee_vel_norm = (ee_vel_new - dataset.EE_vel_mean.to(device)) / (dataset.EE_vel_std.to(device) + eps)
-        l2_norm = torch.norm(feature_pos, p=2, dim=2, keepdim=True)
-        cable_pos_norm = feature_pos / (l2_norm + eps)
-        cable_vel_norm = (feature_vel - dataset.cable_vel_mean_2D.to(device)) / (dataset.cable_vel_std_2D.to(device) + eps)
+    # Normalize cable states
+    cable_pos_normalized = feature_pos / (l2_norm_cable_pos + eps)  # (batch_size, 9, 2)
+    cable_vel_normalized = (feature_vel - dataset.cable_vel_mean_2D.to(device)) / (dataset.cable_vel_std_2D.to(device) + eps)
 
-        # Prepare network inputs
-        robot_state_pos = ee_pos_norm.unsqueeze(1).repeat(1, 9, 1)
-        robot_state_vel = ee_vel_norm.unsqueeze(1).repeat(1, 9, 1)
-        robot_state = torch.cat([robot_state_pos, robot_state_vel], dim=2)
-        dlo_state = torch.cat([cable_pos_norm, cable_vel_norm], dim=2)
-        inputs = torch.cat([robot_state, dlo_state], dim=2).view(-1, 12)
+    # 4. Prepare network inputs
+    # Repeat robot states for each marker
+    robot_state_pos = ee_pos_normalized.unsqueeze(1).repeat(1, 9, 1)  # (batch_size, 9, 4)
+    robot_state_vel = ee_vel_normalized.unsqueeze(1).repeat(1, 9, 1)  # (batch_size, 9, 4)
+    robot_state = torch.cat((robot_state_pos, robot_state_vel), dim=2)  # (batch_size, 9, 8)
 
-        # Predict cable velocities
-        with torch.no_grad():
-            norm_pred_vel = nn_model(inputs).view(batch_size, 9, 2)
+    # Combine with cable states
+    dlo_state = torch.cat((cable_pos_normalized, cable_vel_normalized), dim=2)  # (batch_size, 9, 4)
+    inputs = torch.cat((robot_state, dlo_state), dim=2)  # (batch_size, 9, 12)
 
-        predicted_velocity = norm_pred_vel * dataset.cable_vel_std_2D.to(device) + dataset.cable_vel_mean_2D.to(device)
-        predicted_feature_pos = feature_pos + predicted_velocity
+    # Reshape for the network: (batch_size * 9, 12)
+    inputs = inputs.view(-1, 12)
 
-        # Assemble next state
-        x_next = torch.cat([
-            ee_pos_new,
-            ee_vel_new,
-            predicted_feature_pos.view(batch_size, -1),
-            predicted_velocity.view(batch_size, -1)
-        ], dim=1)
+    # 5. Batch inference with the neural network
+    with torch.no_grad():
+        norm_predicted_velocity = nn_model(inputs)  # (batch_size * 9, 2)
 
-        # Save and propagate
-        x_traj[:, t+1, :] = x_next
-        x_current = x_next
+    # Reshape back: (batch_size, 9, 2)
+    norm_predicted_velocity = norm_predicted_velocity.view(batch_size, 9, 2)
 
-    return x_traj
+    # 6. Denormalize the prediction
+    cable_vel_std_2D = dataset.cable_vel_std_2D.to(device)
+    cable_vel_mean_2D = dataset.cable_vel_mean_2D.to(device)
+    predicted_velocity = norm_predicted_velocity * cable_vel_std_2D + cable_vel_mean_2D
 
-def rollout_trajectory(x0, u_traj, model, dataset, dt=0.02):
-    """
-    Simulate full trajectory given a sequence of controls.
-    
-    Args:
-        x0: Tensor (batch_size, state_dim)
-        u_traj: Tensor (batch_size, horizon, control_dim)
-    Returns:
-        x_traj: Tensor (batch_size, horizon+1, state_dim)
-    """
-    return forward_model_batch(x0, u_traj, model, dataset, dt=dt)
+    # 7. Update cable positions with predicted velocity
+    predicted_feature_pos = feature_pos + predicted_velocity  # (batch_size, 9, 2)
+    # 8. Assemble the next state
+    x_next_batch = torch.cat([
+        ee_pos_new,
+        ee_vel_new,
+        predicted_feature_pos.view(batch_size, -1),
+        predicted_velocity.view(batch_size, -1)
+    ], dim=1)  # (batch_size, 44)
+
+    # Print elapsed time for the batched forward pass
+    return x_next_batch
 
 
-def cost_function_batch(x_batch, p_target, Q):
+
+def cost_function_batch(x_batch, u_batch, p_target, Q, R):
     # x_batch: (batch_size, state_dim)
     # u_batch: (batch_size, control_dim)
     # u_prev_batch: (batch_size, control_dim) or None
@@ -217,13 +210,14 @@ def cost_function_batch(x_batch, p_target, Q):
 
     batch_size = x_batch.shape[0]
     p = x_batch[:, 8:26].view(batch_size, -1)  # (batch_size, 18)
+    p_target = p_target.view(1, -1).repeat(batch_size, 1)  # (batch_size, 18)
     diff = p - p_target  # (batch_size, 18)
 
     # Shape cost: 0.5 * diff^T Q diff
     shape_cost = 0.5 * (diff @ Q * diff).sum(dim=1)  # (batch_size,)
 
     # Control cost: 0.5 * u^T R u
-    #control_cost = 0.5 * (u_batch @ R * u_batch).sum(dim=1)  # (batch_size,)
+    control_cost = 0.5 * (u_batch @ R * u_batch).sum(dim=1)  # (batch_size,)
 
     # New: Change cost if S is not None and u_prev_batch is provided
     # change_cost = 0
@@ -231,38 +225,8 @@ def cost_function_batch(x_batch, p_target, Q):
     #     delta_u = u_batch - u_prev_batch  # (batch_size, control_dim)
     #     change_cost = 0.5 * (delta_u @ S * delta_u).sum(dim=1)  # (batch_size,)
 
-    #return shape_cost + control_cost + change_cost
-    return shape_cost
-
-def two_costs(x_batch, u_batch, p_target, Q, R):
-    # x_batch: (batch_size, state_dim)
-    # u_batch: (batch_size, control_dim)
-    # u_prev_batch: (batch_size, control_dim) or None
-    # S: Weighting matrix for control changes or None
-
-    control_cost = torch.zeros(x_batch.shape[0], device=x_batch.device)
-    batch_size = x_batch.shape[0]
-    p = x_batch[:, 8:26].view(batch_size, -1)  # (batch_size, 18)
-    diff = p - p_target  # (batch_size, 18)
-
-    for t in range(x_batch.shape[1]):
-        u_t = u_batch[:, t, :]
-        
-        # Control cost: 0.5 * u^T R u
-        control_cost = 0.5 * (u_t @ R * u_t).sum(dim=1)  # (batch_size,)
-        final_control_cost += control_cost
-    
-    # Shape cost: 0.5 * diff^T Q diff
-    shape_cost = 0.5 * (diff @ Q * diff).sum(dim=1)  # (batch_size,)
-
-    # New: Change cost if S is not None and u_prev_batch is provided
-    # change_cost = 0
-    # if S is not None and u_prev_batch is not None:
-    #     delta_u = u_batch - u_prev_batch  # (batch_size, control_dim)
-    #     change_cost = 0.5 * (delta_u @ S * delta_u).sum(dim=1)  # (batch_size,)
-
-    #return shape_cost + control_cost + change_cost
-    return shape_cost + control_cost    
+    # return shape_cost + control_cost + change_cost
+    return shape_cost + control_cost
 
 
 def colored_samples(beta, num_samples, horizon, control_dim=4, sigma=None, mu=None, device="cpu"):
@@ -326,20 +290,22 @@ def colored_samples(beta, num_samples, horizon, control_dim=4, sigma=None, mu=No
 
 
 
-def icem_optimize(x_current, p_target, Q, R, elites, elites_prev, horizon=20, control_dim=4, num_iterations=10,
-                  N_init=200, K=20, y=1.25, sigma_init=1.0, min_sigma=0.05, 
+def icem_optimize(x_current, p_target, Q, R, N_init, elites, elites_prev, K, horizon,  num_iterations, sigma_init, control_dim=4,
+                  y=1.25, min_sigma=0.05, 
                   beta_sigma=0.8, elites_frac=0.3):
     """
     Simplified iCEM mockup returning only the first action of the best control sequence.
     """
     # --- Initialization ---
     mu = torch.zeros(horizon, control_dim, device=device)
-    sigma = torch.ones(horizon, control_dim, device=device) * sigma_init
+    sigma = sigma_init.unsqueeze(0).repeat(horizon, 1)
+    # sigma = torch.ones(horizon, control_dim, device=device) * sigma_init
+    
 
     # --- Optimization iterations ---
     for it in range(num_iterations):
 
-        print("icem-Iteration: ", it+1)
+        # print("icem-Iteration: ", it+1)
     
         # --- Adaptive number of samples ---
         if it == 0: # first iteration  
@@ -351,6 +317,7 @@ def icem_optimize(x_current, p_target, Q, R, elites, elites_prev, horizon=20, co
         else:
             N_elites = int(K * elites_frac)
             N_i = int(max(N_init * y ** (-it), 2*K) - N_elites)
+
 
         # --- Sample controls ---
         u_samples = colored_samples(
@@ -365,44 +332,50 @@ def icem_optimize(x_current, p_target, Q, R, elites, elites_prev, horizon=20, co
         # Add previous elites if available
         if it == 0 and elites_prev is not None:
             u_samples = torch.cat([u_samples, elites_prev[:N_elites]], dim=0)  # concat along sample dimension
-            print("Using previous elites.")
+            # print("Using previous elites.")
         elif it == 0 and elites_prev is None:
-            print("No previous elites available.")
+            # print("No previous elites available.")
             pass
         else:
             u_samples = torch.cat([u_samples, elites[:N_elites]], dim=0)  # concat along sample dimension
-            print("Using current elites.")
+            # print("Using current elites.")
             
-        
-            
-        # Add mean action for stability at last step
+         
         if it == num_iterations - 1:
+            x_batch = x_current.clone().repeat(u_samples.shape[0]+1, 1)  # shape (NUM_SAMPLES, state_dim)
+            total_costs = torch.zeros(u_samples.shape[0]+1, device=device)
+            
             mean_sample = u_samples.mean(dim=0, keepdim=True)  # shape (1, horizon, control_dim)
             u_samples = torch.cat([u_samples, mean_sample], dim=0)  # concat along sample dim
 
-            # Simulate trajectories for the mean sample
-            x_batch = rollout_trajectory(x_current.repeat(u_samples.shape[0], 1), u_samples, model, dataset, dt=dt)
-            costs = cost_function_batch(x_batch[:, -1, :], p_target.flatten(), Q)
-            # costs = two_costs(x_batch, u_samples, p_target, Q, R)
+            for t in range(horizon):
+            # Get control signals for this timestep
+                u_t = u_samples[:, t]  # (NUM_SAMPLES, control_dim)
+                x_batch = forward_model_batch(x_batch, u_t, model, pred_mocap_ids, data, dt=0.02)
+                total_costs += cost_function_batch(x_batch, u_t, p_target, Q, R)
             
-            # Select best overall trajectory
-            best_cost_val, u_best_id = torch.min(costs, dim=0)
+            # Select best overall trajectory   
+            best_cost_val, u_best_id = torch.min(total_costs, dim=0)
             u_best = u_samples[u_best_id:u_best_id + 1]  # shape (1, horizon, control_dim)
             
             # Return only the first action
             u_first = u_best[:, 0, :]  # shape (1, control_dim)
             
         else:
-            x_batch = rollout_trajectory(x_current.repeat(u_samples.shape[0], 1), u_samples, model, dataset, dt=dt)
-            costs = cost_function_batch(x_batch[:, -1, :], p_target.flatten(), Q)
-            # costs = two_costs(x_batch, u_samples, p_target, Q, R)
+            x_batch = x_current.clone().repeat(u_samples.shape[0], 1)  # shape (NUM_SAMPLES, state_dim)
+            total_costs = torch.zeros(u_samples.shape[0], device=device)
+            
+            for t in range(horizon):
+                # Get control signals for this timestep
+                u_t = u_samples[:, t]  # (NUM_SAMPLES, control_dim)
+                x_batch = forward_model_batch(x_batch, u_t, model, pred_mocap_ids, data, dt=0.02)
+                total_costs += cost_function_batch(x_batch, u_t, p_target, Q, R)
 
-        print("x_batch:", x_batch.shape)
-        print("u_batch:", u_samples.shape)
-        print("p_target:", p_target.shape)
+
         # --- Select elites ---
-        elite_ids = torch.topk(costs, K, largest=False).indices        
+        elite_ids = torch.topk(total_costs, K, largest=False).indices        
         elites = u_samples[elite_ids]
+        # print("Elites: ", elites)
         
         # if elites is None:
         #     print("Elites is None!")
@@ -413,7 +386,7 @@ def icem_optimize(x_current, p_target, Q, R, elites, elites_prev, horizon=20, co
         mu = torch.mean(elites, dim=0)
         sigma = beta_sigma * sigma + (1 - beta_sigma) * torch.std(elites, dim=0)
         
-    final_cost = costs.min().item() 
+    final_cost = total_costs.min().item() 
     final_mu = mu.mean().item()
     final_sigma = sigma.mean().item()
        
@@ -433,13 +406,13 @@ controller = InverseKinematicsController(
     dt=0.002,
     max_angvel=0.3
 )
-x_current, cable_pos_current, cable_pos_current_3d = get_state_from_mujoco(model, data, dataset, device)
+x_current, cable_pos_current = get_state_from_mujoco(model, data, dataset, device)
 #random_idx = random.randint(0, len(dataset) - 1)
 random_idx = np.random.choice([1940])
 inputs_dumm, p_target = dataset[random_idx]
 p_target = dataset.get_absolute_coords(random_idx)
 p_target = torch.tensor(p_target).view(9, 2)
-error_list = []
+
 
 # Lists for storing results
 trial_results = []  # Each element: (converged (bool), iterations to convergence)
@@ -502,6 +475,7 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
 
         # Optionally, lists to collect additional data during each trial (e.g., errors, costs, EE positions)
         error_list = []
+        error_list2 = []
         ee_positions = []
         all_costs_per_step = []
         all_mu = []
@@ -513,22 +487,22 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
             x_current, cable_pos_current = get_state_from_mujoco(model, data, dataset, device, cable_pos_current)
             ee_pos_current = x_current[:2].cpu().numpy()  # e.g., end-effector position (x,y)
             ee_positions.append(ee_pos_current)
-            print(f"Step {step+1}/{MAX_ITERATIONS}")
+            # print(f"Step {step+1}/{MAX_ITERATIONS}")
 
             
             # Perform MPPI optimization
             U_opt, elites_prev, final_cost, final_mu, final_sigma = icem_optimize(x_current, 
                 p_target, 
                 Q,R,
+                NUM_SAMPLES,
                 elites=elites,
                 elites_prev=elites_prev,
+                K = NUM_ELITES,
                 horizon=horizon, 
-                control_dim=control_dim, 
                 num_iterations=icem_optimizations,
-                N_init=NUM_SAMPLES, 
-                K=NUM_ELITES, 
+                sigma_init=STD_DEV,
+                control_dim=control_dim, 
                 y=reduction_factor, 
-                sigma_init=1.0, 
                 min_sigma=0.05, 
                 beta_sigma=0.8, 
                 elites_frac=elites_frac)
@@ -550,6 +524,7 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
             p_target_cpu = p_target.cpu().numpy()
             error = np.linalg.norm(p_current_now - p_target_cpu, axis=1)
             error_list.append(error)
+            error_list2.append(np.all(np.abs(error)))
             all_costs_per_step.append(final_cost)
             all_mu.append(final_mu)
             all_sigma.append(final_sigma)
@@ -584,6 +559,14 @@ plt.show()
 
 plt.figure()
 plt.plot(error_list, marker='o')
+plt.xlabel("Control step")
+plt.ylabel("Error")
+plt.title("iCEM error over control steps")
+plt.grid(True)
+plt.show()
+
+plt.figure()
+plt.plot(error_list2, marker='o')
 plt.xlabel("Control step")
 plt.ylabel("Error")
 plt.title("iCEM error over control steps")

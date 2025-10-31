@@ -37,26 +37,28 @@ nn_model.eval()
 
 
 # Parameters
-NUM_SAMPLES = 50
-horizon = 20
+NUM_SAMPLES = 100
+horizon = 30
 NUM_ELITES = 10
 elites_frac = 0.3
 colored_beta = 1.0
-icem_optimizations = 5
+icem_optimizations = 4
 reduction_factor = 1.25
 momentum =0.1
+STD_DEV = torch.tensor([0.4, 0.2, 0.02, 0.5], device=device)
+
 
 dt = 0.2
 control_dim = 4
 
 # Define standard deviation for each control dimension
-STD_DEV = torch.tensor([0.2, 0.2, 0.2, 0.5], device=device)
+# STD_DEV = torch.tensor([0.2, 0.2, 0.2, 0.5], device=device)
 Q = torch.eye(18, device=device) * 300
 S = torch.eye(control_dim, device=device) * 10  # Example value, can be adjusted
 R = torch.eye(4, device=device) * 100 # 0.01
 
-NUM_TRIALS = 2  # Number of trials
-MAX_ITERATIONS = 100
+NUM_TRIALS = 10  # Number of trials
+MAX_ITERATIONS = 200
 # corresponds to approx. 30 seconds (with dt ~ 0.02)
 print('Everything loaded successfully.')
 
@@ -226,36 +228,6 @@ def cost_function_batch(x_batch, u_batch, p_target, Q, R):
     # return shape_cost + control_cost + change_cost
     return shape_cost + control_cost
 
-def two_costs(x_batch, u_batch, p_target, Q, R):
-    # x_batch: (batch_size, state_dim)
-    # u_batch: (batch_size, control_dim)
-    # u_prev_batch: (batch_size, control_dim) or None
-    # S: Weighting matrix for control changes or None
-
-    control_cost = torch.zeros(x_batch.shape[0], device=x_batch.device)
-    batch_size = x_batch.shape[0]
-    p = x_batch[:, 8:26].view(batch_size, -1)  # (batch_size, 18)
-    diff = p - p_target  # (batch_size, 18)
-
-    for t in range(x_batch.shape[1]):
-        u_t = u_batch[:, t, :]
-        
-        # Control cost: 0.5 * u^T R u
-        control_cost = 0.5 * (u_t @ R * u_t).sum(dim=1)  # (batch_size,)
-        final_control_cost += control_cost
-    
-    # Shape cost: 0.5 * diff^T Q diff
-    shape_cost = 0.5 * (diff @ Q * diff).sum(dim=1)  # (batch_size,)
-
-    # New: Change cost if S is not None and u_prev_batch is provided
-    # change_cost = 0
-    # if S is not None and u_prev_batch is not None:
-    #     delta_u = u_batch - u_prev_batch  # (batch_size, control_dim)
-    #     change_cost = 0.5 * (delta_u @ S * delta_u).sum(dim=1)  # (batch_size,)
-
-    #return shape_cost + control_cost + change_cost
-    return shape_cost + control_cost    
-
 
 def colored_samples(beta, num_samples, horizon, control_dim=4, sigma=None, mu=None, device="cpu"):
     """
@@ -318,21 +290,22 @@ def colored_samples(beta, num_samples, horizon, control_dim=4, sigma=None, mu=No
 
 
 
-def icem_optimize(x_current, p_target, Q, R, N_init, elites, elites_prev, horizon=20, control_dim=4, num_iterations=10,
-                  K=20, y=1.25, sigma_init=1.0, min_sigma=0.05, 
+def icem_optimize(x_current, p_target, Q, R, N_init, elites, elites_prev, K, horizon,  num_iterations, sigma_init, control_dim=4,
+                  y=1.25, min_sigma=0.05, 
                   beta_sigma=0.8, elites_frac=0.3):
     """
     Simplified iCEM mockup returning only the first action of the best control sequence.
     """
     # --- Initialization ---
     mu = torch.zeros(horizon, control_dim, device=device)
-    sigma = torch.ones(horizon, control_dim, device=device) * sigma_init
+    sigma = sigma_init.unsqueeze(0).repeat(horizon, 1)
+    # sigma = torch.ones(horizon, control_dim, device=device) * sigma_init
     
 
     # --- Optimization iterations ---
     for it in range(num_iterations):
 
-        print("icem-Iteration: ", it+1)
+        # print("icem-Iteration: ", it+1)
     
         # --- Adaptive number of samples ---
         if it == 0: # first iteration  
@@ -359,13 +332,13 @@ def icem_optimize(x_current, p_target, Q, R, N_init, elites, elites_prev, horizo
         # Add previous elites if available
         if it == 0 and elites_prev is not None:
             u_samples = torch.cat([u_samples, elites_prev[:N_elites]], dim=0)  # concat along sample dimension
-            print("Using previous elites.")
+            # print("Using previous elites.")
         elif it == 0 and elites_prev is None:
-            print("No previous elites available.")
+            # print("No previous elites available.")
             pass
         else:
             u_samples = torch.cat([u_samples, elites[:N_elites]], dim=0)  # concat along sample dimension
-            print("Using current elites.")
+            # print("Using current elites.")
             
          
         if it == num_iterations - 1:
@@ -402,6 +375,7 @@ def icem_optimize(x_current, p_target, Q, R, N_init, elites, elites_prev, horizo
         # --- Select elites ---
         elite_ids = torch.topk(total_costs, K, largest=False).indices        
         elites = u_samples[elite_ids]
+        # print("Elites: ", elites)
         
         # if elites is None:
         #     print("Elites is None!")
@@ -438,7 +412,7 @@ random_idx = np.random.choice([1940])
 inputs_dumm, p_target = dataset[random_idx]
 p_target = dataset.get_absolute_coords(random_idx)
 p_target = torch.tensor(p_target).view(9, 2)
-error_list = []
+
 
 # Lists for storing results
 trial_results = []  # Each element: (converged (bool), iterations to convergence)
@@ -501,6 +475,7 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
 
         # Optionally, lists to collect additional data during each trial (e.g., errors, costs, EE positions)
         error_list = []
+        error_list2 = []
         ee_positions = []
         all_costs_per_step = []
         all_mu = []
@@ -512,7 +487,7 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
             x_current, cable_pos_current = get_state_from_mujoco(model, data, dataset, device, cable_pos_current)
             ee_pos_current = x_current[:2].cpu().numpy()  # e.g., end-effector position (x,y)
             ee_positions.append(ee_pos_current)
-            print(f"Step {step+1}/{MAX_ITERATIONS}")
+            # print(f"Step {step+1}/{MAX_ITERATIONS}")
 
             
             # Perform MPPI optimization
@@ -522,12 +497,12 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
                 NUM_SAMPLES,
                 elites=elites,
                 elites_prev=elites_prev,
+                K = NUM_ELITES,
                 horizon=horizon, 
-                control_dim=control_dim, 
                 num_iterations=icem_optimizations,
-                K=NUM_ELITES, 
+                sigma_init=STD_DEV,
+                control_dim=control_dim, 
                 y=reduction_factor, 
-                sigma_init=1.0, 
                 min_sigma=0.05, 
                 beta_sigma=0.8, 
                 elites_frac=elites_frac)
@@ -549,6 +524,7 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
             p_target_cpu = p_target.cpu().numpy()
             error = np.linalg.norm(p_current_now - p_target_cpu, axis=1)
             error_list.append(error)
+            error_list2.append(np.all(np.abs(error)))
             all_costs_per_step.append(final_cost)
             all_mu.append(final_mu)
             all_sigma.append(final_sigma)
@@ -583,6 +559,14 @@ plt.show()
 
 plt.figure()
 plt.plot(error_list, marker='o')
+plt.xlabel("Control step")
+plt.ylabel("Error")
+plt.title("iCEM error over control steps")
+plt.grid(True)
+plt.show()
+
+plt.figure()
+plt.plot(error_list2, marker='o')
 plt.xlabel("Control step")
 plt.ylabel("Error")
 plt.title("iCEM error over control steps")
